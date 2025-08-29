@@ -524,6 +524,24 @@ impl Image {
     }
 
     pub(crate) fn chunk_data_dimensions(&self, chunk_index: u32) -> TiffResult<(u32, u32)> {
+        // Normalize the chunk index to within a single band when planar
+        // configuration is used. This ensures padding on the last tiles or
+        // strips is calculated correctly for each band.
+        let chunks_per_band = match self.planar_config {
+            PlanarConfiguration::Chunky => self.chunk_offsets.len(),
+            PlanarConfiguration::Planar => self
+                .chunk_offsets
+                .len()
+                .checked_div(self.strips_per_pixel())
+                .ok_or(TiffError::FormatError(
+                    TiffFormatError::InconsistentSizesEncountered,
+                ))?,
+        };
+        let chunk_index_in_band = match self.planar_config {
+            PlanarConfiguration::Chunky => chunk_index as usize,
+            PlanarConfiguration::Planar => chunk_index as usize % chunks_per_band,
+        };
+
         let dims = self.chunk_dimensions()?;
 
         match self.chunk_type {
@@ -531,7 +549,7 @@ impl Image {
                 let strip_attrs = self.strip_decoder.as_ref().unwrap();
                 let strips_per_band =
                     self.height.saturating_sub(1) / strip_attrs.rows_per_strip + 1;
-                let strip_height_without_padding = (chunk_index % strips_per_band)
+                let strip_height_without_padding = (chunk_index_in_band as u32 % strips_per_band)
                     .checked_mul(dims.1)
                     .and_then(|x| self.height.checked_sub(x))
                     .ok_or(TiffError::UsageError(UsageError::InvalidChunkIndex(
@@ -545,7 +563,7 @@ impl Image {
             }
             ChunkType::Tile => {
                 let tile_attrs = self.tile_attributes.as_ref().unwrap();
-                let (padding_right, padding_down) = tile_attrs.get_padding(chunk_index as usize);
+                let (padding_right, padding_down) = tile_attrs.get_padding(chunk_index_in_band);
 
                 let tile_width = tile_attrs.tile_width - padding_right;
                 let tile_length = tile_attrs.tile_length - padding_down;

@@ -674,3 +674,15 @@ fn bytes_gray_f32() {
         byte_order_u32,
     );
 }
+
+#[test]
+fn test_multiband_f64() {
+    test_image_sum_f64(
+        "large-f64-multiband.tif",
+        ColorType::Multiband {
+            bit_depth: 64,
+            num_samples: 3,
+        },
+        -23436807936.84004,
+    );
+}
