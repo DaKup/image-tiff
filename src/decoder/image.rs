@@ -367,8 +367,15 @@ impl Image {
     pub(crate) fn minimum_row_stride(&self, dims: (u32, u32)) -> Option<NonZeroUsize> {
         let (width, height) = dims;
 
+        // For planar configuration the minimum row stride should account for all
+        // samples even though each strip/chunk only stores a single band.
+        let samples = match self.planar_config {
+            PlanarConfiguration::Chunky => self.samples_per_pixel(),
+            PlanarConfiguration::Planar => self.samples as usize,
+        };
+
         let row_stride = u64::from(width)
-            .saturating_mul(self.samples_per_pixel() as u64)
+            .saturating_mul(samples as u64)
             .saturating_mul(self.bits_per_sample as u64)
             .div_ceil(8);
 

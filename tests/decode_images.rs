@@ -341,7 +341,9 @@ fn test_tiled_incremental() {
 
 #[test]
 fn test_planar_rgb_u8() {
-    test_image_sum_u8("planar-rgb-u8.tif", ColorType::RGB(8), 15417630);
+    // With planar configuration all bands are interleaved into the output
+    // buffer and contribute to the sum.
+    test_image_sum_u8("planar-rgb-u8.tif", ColorType::RGB(8), 39528948);
 }
 
 #[test]

@@ -921,8 +921,12 @@ impl<R: Read + Seek> Decoder<R> {
         chunk_index: u32,
         output_width: usize,
     ) -> TiffResult<()> {
+        let samples = match self.image.planar_config {
+            PlanarConfiguration::Chunky => self.image.samples_per_pixel(),
+            PlanarConfiguration::Planar => self.image.samples as usize,
+        };
         let output_row_stride = (output_width as u64)
-            .saturating_mul(self.image.samples_per_pixel() as u64)
+            .saturating_mul(samples as u64)
             .saturating_mul(self.image.bits_per_sample as u64)
             .div_ceil(8);
 
@@ -972,9 +976,16 @@ impl<R: Read + Seek> Decoder<R> {
                 .map_err(|_| TiffError::LimitsExceeded)?
         };
 
+        // Account for all samples in planar configuration even though the
+        // underlying storage is separated per band.
+        let samples = match self.image.planar_config {
+            PlanarConfiguration::Chunky => self.image.samples_per_pixel(),
+            PlanarConfiguration::Planar => self.image.samples as usize,
+        };
+
         let buffer_size = row_samples
             .checked_mul(height)
-            .and_then(|x| x.checked_mul(self.image.samples_per_pixel()))
+            .and_then(|x| x.checked_mul(samples))
             .ok_or(TiffError::LimitsExceeded)?;
 
         Ok(match self.image().sample_format {
@@ -1132,10 +1143,8 @@ impl<R: Read + Seek> Decoder<R> {
 
     /// Decodes the entire image and return it as a Vector
     ///
-    /// # Bugs
-    ///
-    /// When the image is stored as a planar configuration, this method will currently only read
-    /// the first sample's plane. This will be fixed in a future major version of `tiff`.
+    /// Supports both chunky and planar configurations. Planar data is
+    /// interleaved into the output buffer.
     pub fn read_image(&mut self) -> TiffResult<DecodingResult> {
         let width = self.image().width;
         let height = self.image().height;
@@ -1151,11 +1160,6 @@ impl<R: Read + Seek> Decoder<R> {
     /// Returns a [`TiffError::UsageError`] if the chunk is smaller than the size indicated with a
     /// call to [`Self::image_buffer_layout`]. Note that the alignment may be arbitrary, but an
     /// alignment smaller than the preferred alignment may perform worse.
-    ///
-    /// # Bugs
-    ///
-    /// When the image is stored as a planar configuration, this method will currently only read
-    /// the first sample's plane. This will be fixed in a future major version of `tiff`.
     pub fn read_image_bytes(&mut self, buffer: &mut [u8]) -> TiffResult<()> {
         let width = self.image().width;
         let height = self.image().height;
@@ -1178,21 +1182,24 @@ impl<R: Read + Seek> Decoder<R> {
             ));
         }
 
-        let samples = self.image().samples_per_pixel();
-        if samples == 0 {
+        let samples_total = self.image.samples as usize;
+        if samples_total == 0 {
             return Err(TiffError::FormatError(
                 TiffFormatError::InconsistentSizesEncountered,
             ));
         }
 
+        let samples_per_chunk = self.image.samples_per_pixel();
+
         let output_row_bits = (width as u64 * self.image.bits_per_sample as u64)
-            .checked_mul(samples as u64)
+            .checked_mul(samples_total as u64)
             .ok_or(TiffError::LimitsExceeded)?;
         let output_row_stride: usize = output_row_bits.div_ceil(8).try_into()?;
 
-        let chunk_row_bits = (chunk_dimensions.0 as u64 * self.image.bits_per_sample as u64)
-            .checked_mul(samples as u64)
-            .ok_or(TiffError::LimitsExceeded)?;
+        let chunk_row_bits =
+            (chunk_dimensions.0 as u64 * self.image.bits_per_sample as u64)
+                .checked_mul(samples_per_chunk as u64)
+                .ok_or(TiffError::LimitsExceeded)?;
         let chunk_row_bytes: usize = chunk_row_bits.div_ceil(8).try_into()?;
 
         let chunks_across = ((width - 1) / chunk_dimensions.0 + 1) as usize;
@@ -1203,24 +1210,67 @@ impl<R: Read + Seek> Decoder<R> {
             ));
         }
 
-        let image_chunks = self.image().chunk_offsets.len() / self.image().strips_per_pixel();
-        // For multi-band images, only the first band is read.
-        // Possible improvements:
-        // * pass requested band as parameter
-        // * collect bands to a RGB encoding result in case of RGB bands
-        for chunk in 0..image_chunks {
-            self.goto_offset_u64(self.image().chunk_offsets[chunk])?;
+        if self.image.planar_config == PlanarConfiguration::Planar {
+            let chunks_per_band =
+                self.image().chunk_offsets.len() / self.image().strips_per_pixel();
+            let bytes_per_sample = (self.image.bits_per_sample as usize + 7) / 8;
+            let mut chunk_buf = vec![0u8; chunk_row_bytes * chunk_dimensions.1 as usize];
 
-            let x = chunk % chunks_across;
-            let y = chunk / chunks_across;
-            let buffer_offset =
-                y * output_row_stride * chunk_dimensions.1 as usize + x * chunk_row_bytes;
-            self.image.expand_chunk(
-                &mut self.value_reader,
-                &mut buffer[buffer_offset..],
-                output_row_stride,
-                chunk as u32,
-            )?;
+            for band in 0..samples_total {
+                for chunk in 0..chunks_per_band {
+                    let index = band * chunks_per_band + chunk;
+                    self.goto_offset_u64(self.image().chunk_offsets[index])?;
+
+                    // Read chunk for this band
+                    self.image.expand_chunk(
+                        &mut self.value_reader,
+                        &mut chunk_buf,
+                        chunk_row_bytes,
+                        index as u32,
+                    )?;
+
+                    let x = chunk % chunks_across;
+                    let y = chunk / chunks_across;
+                    let band_offset = band * bytes_per_sample;
+
+                    let data_dims = self.image().chunk_data_dimensions(index as u32)?;
+
+                    for row in 0..data_dims.1 as usize {
+                        let src_row = &chunk_buf[row * chunk_row_bytes
+                            ..row * chunk_row_bytes + bytes_per_sample * data_dims.0 as usize];
+                        let dst_row_start =
+                            (y * chunk_dimensions.1 as usize + row) * output_row_stride
+                                + x * chunk_row_bytes * samples_total
+                                + band_offset;
+                        let dst_row = &mut buffer[dst_row_start..];
+
+                        for pix in 0..data_dims.0 as usize {
+                            let src_start = pix * bytes_per_sample;
+                            let dst_start = pix * bytes_per_sample * samples_total;
+                            dst_row[dst_start..dst_start + bytes_per_sample]
+                                .copy_from_slice(
+                                    &src_row[src_start..src_start + bytes_per_sample],
+                                );
+                        }
+                    }
+                }
+            }
+        } else {
+            let image_chunks = self.image().chunk_offsets.len();
+            for chunk in 0..image_chunks {
+                self.goto_offset_u64(self.image().chunk_offsets[chunk])?;
+
+                let x = chunk % chunks_across;
+                let y = chunk / chunks_across;
+                let buffer_offset =
+                    y * output_row_stride * chunk_dimensions.1 as usize + x * chunk_row_bytes;
+                self.image.expand_chunk(
+                    &mut self.value_reader,
+                    &mut buffer[buffer_offset..],
+                    output_row_stride,
+                    chunk as u32,
+                )?;
+            }
         }
 
         Ok(())

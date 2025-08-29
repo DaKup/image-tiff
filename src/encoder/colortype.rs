@@ -351,3 +351,42 @@ impl ColorType for CMYKA8 {
 
     integer_horizontal_predict!();
 }
+
+macro_rules! multiband_int_color {
+    ($name:ident, $ty:ty, $sf:expr) => {
+        pub struct $name<const N: usize>;
+        impl<const N: usize> ColorType for $name<N> {
+            type Inner = $ty;
+            const TIFF_VALUE: PhotometricInterpretation = PhotometricInterpretation::BlackIsZero;
+            const BITS_PER_SAMPLE: &'static [u16] = &[ (std::mem::size_of::<$ty>() as u16 * 8); N ];
+            const SAMPLE_FORMAT: &'static [SampleFormat] = &[$sf; N];
+            integer_horizontal_predict!();
+        }
+    };
+}
+
+macro_rules! multiband_float_color {
+    ($name:ident, $ty:ty) => {
+        pub struct $name<const N: usize>;
+        impl<const N: usize> ColorType for $name<N> {
+            type Inner = $ty;
+            const TIFF_VALUE: PhotometricInterpretation = PhotometricInterpretation::BlackIsZero;
+            const BITS_PER_SAMPLE: &'static [u16] = &[ (std::mem::size_of::<$ty>() as u16 * 8); N ];
+            const SAMPLE_FORMAT: &'static [SampleFormat] = &[SampleFormat::IEEEFP; N];
+            fn horizontal_predict(_: &[Self::Inner], _: &mut Vec<Self::Inner>) {
+                unreachable!()
+            }
+        }
+    };
+}
+
+multiband_int_color!(MultiBandU8, u8, SampleFormat::Uint);
+multiband_int_color!(MultiBandI8, i8, SampleFormat::Int);
+multiband_int_color!(MultiBandU16, u16, SampleFormat::Uint);
+multiband_int_color!(MultiBandI16, i16, SampleFormat::Int);
+multiband_int_color!(MultiBandU32, u32, SampleFormat::Uint);
+multiband_int_color!(MultiBandI32, i32, SampleFormat::Int);
+multiband_int_color!(MultiBandU64, u64, SampleFormat::Uint);
+multiband_int_color!(MultiBandI64, i64, SampleFormat::Int);
+multiband_float_color!(MultiBandF32, f32);
+multiband_float_color!(MultiBandF64, f64);

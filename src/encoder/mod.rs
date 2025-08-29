@@ -11,7 +11,10 @@ use std::{
 use crate::{
     decoder::ifd::Entry,
     error::{TiffResult, UsageError},
-    tags::{CompressionMethod, IfdPointer, ResolutionUnit, SampleFormat, Tag, Type},
+    tags::{
+        CompressionMethod, IfdPointer, PlanarConfiguration, ResolutionUnit, SampleFormat, Tag,
+        Type,
+    },
     Directory, TiffError, TiffFormatError,
 };
 
@@ -200,7 +203,14 @@ impl<W: Write + Seek, K: TiffKind> TiffEncoder<W, K> {
         height: u32,
     ) -> TiffResult<ImageEncoder<'_, W, C, K>> {
         let encoder = Self::chain_directory(&mut self.writer, &mut self.last_ifd_chain)?;
-        ImageEncoder::new(encoder, width, height, self.compression, self.predictor)
+        ImageEncoder::new(
+            encoder,
+            width,
+            height,
+            self.compression,
+            self.predictor,
+            PlanarConfiguration::Chunky,
+        )
     }
 
     /// Convenience function to write an entire image from memory.
@@ -214,8 +224,54 @@ impl<W: Write + Seek, K: TiffKind> TiffEncoder<W, K> {
         [C::Inner]: TiffValue,
     {
         let encoder = Self::chain_directory(&mut self.writer, &mut self.last_ifd_chain)?;
-        let image: ImageEncoder<W, C, K> =
-            ImageEncoder::new(encoder, width, height, self.compression, self.predictor)?;
+        let image: ImageEncoder<W, C, K> = ImageEncoder::new(
+            encoder,
+            width,
+            height,
+            self.compression,
+            self.predictor,
+            PlanarConfiguration::Chunky,
+        )?;
+        image.write_data(data)
+    }
+
+    /// Create an [`ImageEncoder`] for a planar image where samples are stored
+    /// in separate bands.
+    pub fn new_image_planar<C: ColorType>(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> TiffResult<ImageEncoder<'_, W, C, K>> {
+        let encoder = Self::chain_directory(&mut self.writer, &mut self.last_ifd_chain)?;
+        ImageEncoder::new(
+            encoder,
+            width,
+            height,
+            self.compression,
+            self.predictor,
+            PlanarConfiguration::Planar,
+        )
+    }
+
+    /// Convenience function to write an entire planar image from memory.
+    pub fn write_image_planar<C: ColorType>(
+        &mut self,
+        width: u32,
+        height: u32,
+        data: &[C::Inner],
+    ) -> TiffResult<()>
+    where
+        [C::Inner]: TiffValue,
+    {
+        let encoder = Self::chain_directory(&mut self.writer, &mut self.last_ifd_chain)?;
+        let image: ImageEncoder<W, C, K> = ImageEncoder::new(
+            encoder,
+            width,
+            height,
+            self.compression,
+            self.predictor,
+            PlanarConfiguration::Planar,
+        )?;
         image.write_data(data)
     }
 
@@ -488,6 +544,8 @@ pub struct ImageEncoder<'a, W: 'a + Write + Seek, C: ColorType, K: TiffKind> {
     width: u32,
     height: u32,
     rows_per_strip: u64,
+    samples_per_pixel: u64,
+    planar_config: PlanarConfiguration,
     strip_offsets: Vec<K::OffsetType>,
     strip_byte_count: Vec<K::OffsetType>,
     dropped: bool,
@@ -515,6 +573,7 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind> ImageEncoder<'a, W, T,
         height: u32,
         compression: Compression,
         predictor: Predictor,
+        planar_config: PlanarConfiguration,
     ) -> TiffResult<Self> {
         if width == 0 || height == 0 {
             return Err(TiffError::FormatError(TiffFormatError::InvalidDimensions(
@@ -524,7 +583,11 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind> ImageEncoder<'a, W, T,
 
         Self::sanity_check(compression, predictor)?;
 
-        let row_samples = u64::from(width) * u64::try_from(<T>::BITS_PER_SAMPLE.len())?;
+        let samples_per_pixel = u64::try_from(<T>::BITS_PER_SAMPLE.len())?;
+        let row_samples = match planar_config {
+            PlanarConfiguration::Chunky => u64::from(width) * samples_per_pixel,
+            PlanarConfiguration::Planar => u64::from(width),
+        };
         let row_bytes = row_samples * u64::from(<T::Inner>::BYTE_LEN);
 
         // Limit the strip size to prevent potential memory and security issues.
@@ -536,7 +599,11 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind> ImageEncoder<'a, W, T,
             }
         };
 
-        let strip_count = u64::from(height).div_ceil(rows_per_strip);
+        let strips_per_band = u64::from(height).div_ceil(rows_per_strip);
+        let strip_count = match planar_config {
+            PlanarConfiguration::Chunky => strips_per_band,
+            PlanarConfiguration::Planar => strips_per_band * samples_per_pixel,
+        };
 
         encoder.write_tag(Tag::ImageWidth, width)?;
         encoder.write_tag(Tag::ImageLength, height)?;
@@ -547,12 +614,15 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind> ImageEncoder<'a, W, T,
         let sample_format: Vec<_> = <T>::SAMPLE_FORMAT.iter().map(|s| s.to_u16()).collect();
         encoder.write_tag(Tag::SampleFormat, &sample_format[..])?;
         encoder.write_tag(Tag::PhotometricInterpretation, <T>::TIFF_VALUE.to_u16())?;
+        if planar_config == PlanarConfiguration::Planar {
+            encoder.write_tag(Tag::PlanarConfiguration, planar_config.to_u16())?;
+        }
 
         encoder.write_tag(Tag::RowsPerStrip, u32::try_from(rows_per_strip)?)?;
 
         encoder.write_tag(
             Tag::SamplesPerPixel,
-            u16::try_from(<T>::BITS_PER_SAMPLE.len())?,
+            u16::try_from(samples_per_pixel)?,
         )?;
         encoder.write_tag(Tag::XResolution, Rational { n: 1, d: 1 })?;
         encoder.write_tag(Tag::YResolution, Rational { n: 1, d: 1 })?;
@@ -566,6 +636,8 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind> ImageEncoder<'a, W, T,
             rows_per_strip,
             width,
             height,
+             samples_per_pixel,
+             planar_config,
             strip_offsets: Vec::new(),
             strip_byte_count: Vec::new(),
             dropped: false,
@@ -581,7 +653,13 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind> ImageEncoder<'a, W, T,
             return 0;
         }
 
-        let raw_start_row = self.strip_idx * self.rows_per_strip;
+        let strips_per_band = if self.planar_config == PlanarConfiguration::Planar {
+            self.strip_count / self.samples_per_pixel
+        } else {
+            self.strip_count
+        };
+        let strip_in_band = self.strip_idx % strips_per_band;
+        let raw_start_row = strip_in_band * self.rows_per_strip;
         let start_row = cmp::min(u64::from(self.height), raw_start_row);
         let end_row = cmp::min(u64::from(self.height), raw_start_row + self.rows_per_strip);
 
@@ -706,6 +784,9 @@ impl<'a, W: 'a + Write + Seek, T: ColorType, K: TiffKind> ImageEncoder<'a, W, T,
 
         let value: u64 = value as u64;
         self.strip_count = (self.height as u64).div_ceil(value);
+        if self.planar_config == PlanarConfiguration::Planar {
+            self.strip_count *= self.samples_per_pixel;
+        }
         self.rows_per_strip = value;
 
         Ok(())
